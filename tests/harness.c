@@ -125,6 +125,24 @@ int main(int argc, char **argv)
     printf("   GetRenderState: %.1f ns a call before, %.1f ns with the watchdog\n", before, after);
 
     IDirect3DVertexBuffer9_Release(vb);
+
+    printf("== Reset: who still holds a D3DPOOL_DEFAULT resource\n");
+    IDirect3DTexture9 *target = NULL;
+    IDirect3DIndexBuffer9 *ib = NULL;
+    IDirect3DSurface9 *back = NULL;
+    ok(SUCCEEDED(IDirect3DDevice9_CreateTexture(dev, 128, 64, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &target, NULL)),
+       "a render-target texture in D3DPOOL_DEFAULT");
+    ok(SUCCEEDED(IDirect3DDevice9_CreateIndexBuffer(dev, 600, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, NULL)),
+       "a dynamic index buffer in it");
+    ok(SUCCEEDED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back)), "the back buffer, kept");
+    D3DPRESENT_PARAMETERS rp = pp;
+    ok(FAILED(IDirect3DDevice9_Reset(dev, &rp)), "Reset fails while they are referenced");
+    IDirect3DIndexBuffer9_Release(ib);
+    IDirect3DSurface9_Release(back);
+    IDirect3DTexture9_Release(target);
+    rp = pp;
+    ok(SUCCEEDED(IDirect3DDevice9_Reset(dev, &rp)), "and succeeds once they are released");
+
     IDirect3DTexture9_Release(tex);
     IDirect3DDevice9_Release(dev);
     IDirect3D9_Release(d3d);
@@ -137,15 +155,30 @@ int main(int argc, char **argv)
     FILE *f = fopen(exe, "r");
     char line[2048];
     int named = 0, thread_lines = 0, deleted_lines = 0;
+    int reset_watched = 0, reset_failed = 0, held_texture = 0, held_ib = 0, held_back = 0, held_vb = 0, reset_ok = 0;
     while (f && fgets(line, sizeof line, f)) {
         printf("   log: %s", line);
         if (strstr(line, "another thread") && strstr(line, "harness.exe+0x")) { named++; thread_lines++; }
         if (strstr(line, "deleted") && strstr(line, "harness.exe+0x")) deleted_lines++;
+        if (strstr(line, "watching Reset on DXVK's device")) reset_watched++;
+        if (strstr(line, "Reset failed (0x8876086C D3DERR_INVALIDCALL)") && strstr(line, "still referenced")) reset_failed++;
+        if (strstr(line, "texture 128x64 A8R8G8B8 (render target), 1 reference(s): made by harness.exe+0x")) held_texture++;
+        if (strstr(line, "index buffer 600 bytes, 16-bit (dynamic, write-only), 1 reference(s): made by harness.exe+0x")) held_ib++;
+        if (strstr(line, "surface ") && strstr(line, "fetched by harness.exe+0x")) held_back++;
+        if (strstr(line, "vertex buffer 4096")) held_vb++;
+        if (strstr(line, "Reset succeeded")) reset_ok++;
     }
     if (f) fclose(f);
     ok(named > 0, "the log names the caller (harness.exe+offset)");
     ok(thread_lines == 2 + 2 + 1, "per call site at counts 1, 2, 4: 3 lines for the device call, 2 for the texture's");
     ok(deleted_lines == 3, "one line for each deleted-object report");
+    ok(reset_watched == 1, "Reset is watched on DXVK's device");
+    ok(reset_failed == 1, "the failed Reset is logged with its result");
+    ok(held_texture == 1, "and lists the render-target texture, made by harness.exe+offset");
+    ok(held_ib == 1, "the index buffer");
+    ok(held_back == 1, "and the back buffer, fetched by harness.exe+offset");
+    ok(held_vb == 0, "but not the vertex buffer released before it");
+    ok(reset_ok == 1, "the Reset after releasing them is logged as succeeded");
 
     printf("\nd3d9watch: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

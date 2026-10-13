@@ -20,9 +20,20 @@
  * refcount at +8 gets 0x80000000 added just before the object is freed.
  * Under DXVK (found by its RTTI), every texture, surface and buffer method
  * is hooked as well: called from another thread, or on a deleted object.
+ *
+ * Under DXVK it also names what makes Reset fail. Reset refuses while any
+ * D3DPOOL_DEFAULT resource is still referenced, and RenderWare does not check
+ * its result: when a window resize makes it reset the device, a failed Reset
+ * leaves its camera raster released and the next clear reads a NULL texture
+ * (gta_sa.exe+0x3F7C82, 2026-10-13). So DXVK's own device methods, beneath
+ * every proxy, record who makes each D3DPOOL_DEFAULT resource and who fetches
+ * surfaces, and a failed Reset lists what is still held.
+ *
  * It only watches; every call goes on to the original unchanged.
  */
+#define COBJMACROS
 #include <windows.h>
+#include <d3d9.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,7 +149,7 @@ static unsigned ntables;
 static volatile DWORD render_tid;   /* read by the stubs */
 static unsigned char *stubs;
 static unsigned nstubs;
-static HMODULE self, d3d9_module;
+static HMODULE self, d3d9_module, dxvk_module;
 static int dxvk;                    /* resource vtables known: deleted checks are possible */
 
 static CRITICAL_SECTION lock;
@@ -209,30 +220,46 @@ static int after_call(const unsigned char *r)
     return 0;
 }
 
-/* The caller and the next few return addresses on the stack, outside
- * d3d9.dll and this plugin. */
-static void stack_text(void **frame, char *out, size_t n)
+/* The caller (frame[0]) and the next return addresses on the stack, up to
+ * `max`, outside `skip` and this plugin. */
+static unsigned stack_sites(void **frame, HMODULE skip, void **out, unsigned max)
 {
-    char one[160];
-    size_t used = 0;
-    int found = 0;
-    out[0] = 0;
+    unsigned found = 0;
     MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(frame, &mbi, sizeof mbi)) return;
+    if (!VirtualQuery(frame, &mbi, sizeof mbi)) return 0;
     void **top = (void **)((char *)mbi.BaseAddress + mbi.RegionSize);
-    for (void **p = frame; p < top && p < frame + 2048 && found < 6; p++) {
+    for (void **p = frame; p < top && p < frame + 2048 && found < max; p++) {
         void *v = *p;
         if (!in_code(v) || !after_call(v)) continue;
         HMODULE mod = NULL;
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCSTR)v, &mod);
-        if ((mod == d3d9_module || mod == self) && p != frame) continue;
-        if (!where(v, one, sizeof one)) continue;
-        int w = snprintf(out + used, n - used, "%s%s", found ? " < " : "", one);
+        if ((mod == skip || mod == self) && p != frame) continue;
+        out[found++] = v;
+    }
+    return found;
+}
+
+/* "a < b < c" */
+static void sites_text(void *const *sites, unsigned count, char *out, size_t n)
+{
+    char one[160];
+    size_t used = 0;
+    out[0] = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (!sites[i] || !where(sites[i], one, sizeof one)) continue;
+        int w = snprintf(out + used, n - used, "%s%s", used ? " < " : "", one);
         if (w < 0 || (size_t)w >= n - used) break;
         used += (size_t)w;
-        found++;
     }
+}
+
+/* The caller and the next few return addresses on the stack, outside
+ * d3d9.dll and this plugin. */
+static void stack_text(void **frame, char *out, size_t n)
+{
+    void *sites[6];
+    sites_text(sites, stack_sites(frame, d3d9_module, sites, 6), out, n);
 }
 
 /* One line per call site and kind, then at counts 1, 2, 4, 8... */
@@ -439,12 +466,444 @@ static void **find_vtable(HMODULE mod, const char *rtti)
     return NULL;
 }
 
+/* ---- Reset: who still holds a D3DPOOL_DEFAULT resource -------------------
+ *
+ * DXVK's Reset returns D3DERR_INVALIDCALL while any D3DPOOL_DEFAULT resource
+ * still has a reference: a texture, buffer or surface made in that pool, a
+ * second swap chain, or the back buffer or depth surface when something kept
+ * what GetBackBuffer, GetRenderTarget or GetDepthStencilSurface handed it.
+ * RenderWare never checks: a window resize makes _rwD3D9CameraClear release
+ * its video memory and Reset (gta_sa.exe 0x7F795B, 0x7F7998, then 0x7F7AAC
+ * with fallback parameters), and after a failed one it clears the camera
+ * raster it has just released (gta_sa.exe+0x3F7C82, 2026-10-13).
+ *
+ * The wrappers sit on DXVK's own device vtable, beneath every proxy
+ * (ProperShaders', MoonLoader's, SA-MP's), so they see the resources those
+ * make for themselves as well as the game's, and Reset only after every
+ * layer above has released what it was going to. A made resource keeps the
+ * caller and three more return addresses; a fetched surface keeps its
+ * distinct callers only, since GetRenderTarget runs every frame. When Reset
+ * fails, everything recorded that is still referenced is listed. */
+#define HELD_SLOTS 16384
+#define HELD_SITES 4
+enum { HELD_TEXTURE, HELD_VOLUME, HELD_CUBE, HELD_VB, HELD_IB, HELD_RT, HELD_DS, HELD_PLAIN, HELD_SWAPCHAIN, HELD_FETCHED };
+static const char *const held_kinds[] = {
+    "texture", "volume texture", "cube texture", "vertex buffer", "index buffer",
+    "render target", "depth surface", "offscreen surface", "swap chain", "surface",
+};
+
+typedef struct {
+    void *object;                       /* NULL: a free slot */
+    void *vptr;                         /* the object's when recorded: gone once it differs */
+    unsigned kind, w, h, format, usage; /* w = length for a buffer, format = FVF for a vertex buffer */
+    void *made[HELD_SITES];             /* who made it: the caller, then up the stack */
+    void *fetch[HELD_SITES];            /* distinct callers that fetched it from the device */
+    unsigned fetches[HELD_SITES];
+} Held;
+
+static Held *held;                      /* HELD_SLOTS, open addressing; pruned, never deleted from */
+static unsigned held_count;
+static LONG held_full;
+static int tracking;
+static void *dev_orig[DEVICE_METHODS];  /* DXVK's device methods beneath the wrappers */
+
+static int readable(const void *p, size_t n)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return 0;
+    return (const char *)p + n <= (const char *)mbi.BaseAddress + mbi.RegionSize;
+}
+
+/* The public reference count (ComObject's, at +4), or -1 once it is gone. */
+static long held_refs(const Held *e)
+{
+    if (!readable(e->object, 12) || *(void *const volatile *)e->object != e->vptr || deleted(e->object))
+        return -1;
+    return (long)((const volatile unsigned *)e->object)[1];
+}
+
+static Held *held_find(void *object, int free_slot)
+{
+    unsigned h = (unsigned)(((uintptr_t)object >> 3) * 2654435761u) % HELD_SLOTS;
+    for (unsigned probe = 0; probe < HELD_SLOTS; probe++, h = (h + 1) % HELD_SLOTS) {
+        if (held[h].object == object) return &held[h];
+        if (!held[h].object) return free_slot ? &held[h] : NULL;
+    }
+    return NULL;
+}
+
+/* Keep what is still alive, referenced or not. */
+static void held_prune(void)
+{
+    Held *old = malloc(HELD_SLOTS * sizeof *old);
+    if (!old) return;
+    memcpy(old, held, HELD_SLOTS * sizeof *old);
+    memset(held, 0, HELD_SLOTS * sizeof *held);
+    held_count = 0;
+    for (unsigned i = 0; i < HELD_SLOTS; i++)
+        if (old[i].object && held_refs(&old[i]) >= 0) {
+            *held_find(old[i].object, 1) = old[i];
+            held_count++;
+        }
+    free(old);
+}
+
+/* The entry for `object`, cleared when it is new or its address was reused.
+ * Under the lock. */
+static Held *held_entry(void *object, unsigned kind)
+{
+    Held *e = held_find(object, 0);
+    if (!e) {
+        if (held_count >= HELD_SLOTS * 3 / 4) held_prune();
+        if (held_count >= HELD_SLOTS * 3 / 4) {
+            if (InterlockedIncrement(&held_full) == 1)
+                log_line("more than %d D3DPOOL_DEFAULT resources alive; new ones are not recorded", HELD_SLOTS * 3 / 4);
+            return NULL;
+        }
+        e = held_find(object, 1);
+        held_count++;
+    } else if (e->vptr == *(void **)object && kind == HELD_FETCHED) {
+        return e;
+    }
+    memset(e, 0, sizeof *e);
+    e->object = object;
+    e->vptr = *(void **)object;
+    e->kind = kind;
+    return e;
+}
+
+static void held_made(void *object, unsigned kind, unsigned w, unsigned h, unsigned format, unsigned usage, void **frame)
+{
+    if (!object || !held) return;
+    void *sites[HELD_SITES];
+    unsigned n = stack_sites(frame, dxvk_module, sites, HELD_SITES);   /* slow: outside the lock */
+    EnterCriticalSection(&lock);
+    Held *e = held_entry(object, kind);
+    if (e) {
+        e->w = w; e->h = h; e->format = format; e->usage = usage;
+        memcpy(e->made, sites, n * sizeof *sites);
+    }
+    LeaveCriticalSection(&lock);
+}
+
+static void held_fetched(void *object, void *caller)
+{
+    if (!object || !held) return;
+    EnterCriticalSection(&lock);
+    Held *e = held_entry(object, HELD_FETCHED);
+    if (e) {
+        for (unsigned i = 0; i < HELD_SITES; i++) {
+            if (e->fetch[i] == caller) { e->fetches[i]++; break; }
+            if (!e->fetch[i]) { e->fetch[i] = caller; e->fetches[i] = 1; break; }
+        }
+    }
+    LeaveCriticalSection(&lock);
+}
+
+static const char *format_text(unsigned f, char *buf, size_t n)
+{
+    switch (f) {
+    case D3DFMT_A8R8G8B8: return "A8R8G8B8";
+    case D3DFMT_X8R8G8B8: return "X8R8G8B8";
+    case D3DFMT_R5G6B5: return "R5G6B5";
+    case D3DFMT_A8: return "A8";
+    case D3DFMT_L8: return "L8";
+    case D3DFMT_A2R10G10B10: return "A2R10G10B10";
+    case D3DFMT_A16B16G16R16: return "A16B16G16R16";
+    case D3DFMT_R16F: return "R16F";
+    case D3DFMT_G16R16F: return "G16R16F";
+    case D3DFMT_A16B16G16R16F: return "A16B16G16R16F";
+    case D3DFMT_R32F: return "R32F";
+    case D3DFMT_A32B32G32R32F: return "A32B32G32R32F";
+    case D3DFMT_D16: return "D16";
+    case D3DFMT_D24S8: return "D24S8";
+    case D3DFMT_D24X8: return "D24X8";
+    case D3DFMT_D32: return "D32";
+    case D3DFMT_INDEX16: return "16-bit";
+    case D3DFMT_INDEX32: return "32-bit";
+    }
+    if (f >= 0x20202020u) {   /* a FOURCC: INTZ, RAWZ, DF24, NULL, ... */
+        snprintf(buf, n, "%c%c%c%c", (char)f, (char)(f >> 8), (char)(f >> 16), (char)(f >> 24));
+        return buf;
+    }
+    snprintf(buf, n, "format %u", f);
+    return buf;
+}
+
+/* "512x512 A8R8G8B8 (render target, dynamic)" */
+static void held_desc(const Held *e, char *out, size_t n)
+{
+    char fmt[24];
+    unsigned w = e->w, h = e->h, format = e->format, usage = e->usage;
+    if (e->kind == HELD_FETCHED) {   /* the device's own surfaces: ask them */
+        D3DSURFACE_DESC d;
+        if (SUCCEEDED(IDirect3DSurface9_GetDesc((IDirect3DSurface9 *)e->object, &d))) {
+            w = d.Width; h = d.Height; format = d.Format; usage = d.Usage;
+        }
+    }
+    int at;
+    if (e->kind == HELD_VB)
+        at = snprintf(out, n, "%u bytes, FVF 0x%X", w, format);
+    else if (e->kind == HELD_IB)
+        at = snprintf(out, n, "%u bytes, %s", w, format_text(format, fmt, sizeof fmt));
+    else if (e->kind == HELD_SWAPCHAIN)
+        at = snprintf(out, n, "%ux%u", w, h);
+    else
+        at = snprintf(out, n, "%ux%u %s", w, h, format_text(format, fmt, sizeof fmt));
+    if (at < 0 || (size_t)at >= n) return;
+    static const struct { DWORD bit; const char *name; } flags[] = {
+        { D3DUSAGE_RENDERTARGET, "render target" }, { D3DUSAGE_DEPTHSTENCIL, "depth" },
+        { D3DUSAGE_DYNAMIC, "dynamic" }, { D3DUSAGE_WRITEONLY, "write-only" },
+        { D3DUSAGE_AUTOGENMIPMAP, "mipmaps" },
+    };
+    const char *sep = " (";
+    for (size_t i = 0; i < sizeof flags / sizeof *flags; i++)
+        if (usage & flags[i].bit) {
+            int w2 = snprintf(out + at, n - (size_t)at, "%s%s", sep, flags[i].name);
+            if (w2 < 0 || (size_t)w2 >= n - (size_t)at) return;
+            at += w2; sep = ", ";
+        }
+    if (*sep == ',') snprintf(out + at, n - (size_t)at, ")");
+}
+
+static const char *hresult_text(HRESULT hr)
+{
+    switch ((unsigned)hr) {
+    case 0x8876086Cu: return "D3DERR_INVALIDCALL";
+    case 0x88760868u: return "D3DERR_DEVICELOST";
+    case 0x88760869u: return "D3DERR_DEVICENOTRESET";
+    case 0x8876017Cu: return "D3DERR_OUTOFVIDEOMEMORY";
+    case 0x88760827u: return "D3DERR_DRIVERINTERNALERROR";
+    case 0x8007000Eu: return "E_OUTOFMEMORY";
+    }
+    return "?";
+}
+
+/* After a failed Reset: everything recorded that is still referenced, alike
+ * ones on one line. */
+static void held_report(HRESULT hr)
+{
+    if (!held) return;
+    EnterCriticalSection(&lock);
+    Held *alive = malloc(HELD_SLOTS * sizeof *alive);
+    long *refs = malloc(HELD_SLOTS * sizeof *refs);
+    unsigned n = 0;
+    for (unsigned i = 0; alive && refs && i < HELD_SLOTS; i++) {
+        long r;
+        if (held[i].object && (r = held_refs(&held[i])) > 0) {
+            alive[n] = held[i];
+            refs[n++] = r;
+        }
+    }
+    LeaveCriticalSection(&lock);
+    if (!n) {
+        log_line("Reset failed (0x%08lX %s), and nothing d3d9watch saw made or fetched in D3DPOOL_DEFAULT is still "
+                 "referenced: the holder made it before d3d9watch started, or through another device",
+                 (unsigned long)hr, hresult_text(hr));
+    } else {
+        log_line("Reset failed (0x%08lX %s): %u D3DPOOL_DEFAULT resource(s) still referenced",
+                 (unsigned long)hr, hresult_text(hr), n);
+    }
+    char desc[128], made[700], fetched[700], one[160];
+    for (unsigned i = 0; i < n; i++) {
+        if (!alive[i].object) continue;
+        unsigned same = 1;
+        long total = refs[i];
+        for (unsigned j = i + 1; j < n; j++) {
+            Held *a = &alive[i], *b = &alive[j];
+            if (b->object && a->kind == b->kind && a->w == b->w && a->h == b->h && a->format == b->format
+                && a->usage == b->usage && memcmp(a->made, b->made, sizeof a->made) == 0
+                && memcmp(a->fetch, b->fetch, sizeof a->fetch) == 0) {
+                same++;
+                total += refs[j];
+                b->object = NULL;
+            }
+        }
+        held_desc(&alive[i], desc, sizeof desc);
+        sites_text(alive[i].made, HELD_SITES, made, sizeof made);
+        size_t used = 0;
+        fetched[0] = 0;
+        for (unsigned k = 0; k < HELD_SITES && alive[i].fetch[k]; k++) {
+            if (!where(alive[i].fetch[k], one, sizeof one)) continue;
+            int w = snprintf(fetched + used, sizeof fetched - used, "%s%s (x%u)", used ? ", " : "", one, alive[i].fetches[k]);
+            if (w < 0 || (size_t)w >= sizeof fetched - used) break;
+            used += (size_t)w;
+        }
+        char count[24] = "";
+        if (same > 1) snprintf(count, sizeof count, " x%u", same);
+        log_line("  %s %s%s, %ld reference(s)%s%s%s%s", held_kinds[alive[i].kind], desc, count, total,
+                 made[0] ? ": made by " : "", made,
+                 fetched[0] ? (made[0] ? "; fetched by " : ": fetched by ") : "", fetched);
+    }
+    free(alive);
+    free(refs);
+}
+
+#define CALL_ORIG(slot, type, ...) (((type)dev_orig[slot])(__VA_ARGS__))
+/* The wrapper's caller: [ebp+4] is the return address, then `this` and the arguments. */
+#define FRAME() ((void **)__builtin_frame_address(0) + 1)
+
+static HRESULT WINAPI w_CreateAdditionalSwapChain(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *pp, IDirect3DSwapChain9 **out)
+{
+    HRESULT hr = CALL_ORIG(13, HRESULT (WINAPI *)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *, IDirect3DSwapChain9 **), d, pp, out);
+    if (SUCCEEDED(hr) && out && pp)
+        held_made(*out, HELD_SWAPCHAIN, pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat, 0, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_Reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *pp)
+{
+    char stack[900];
+    void *sites[6];
+    sites_text(sites, stack_sites(FRAME(), dxvk_module, sites, 6), stack, sizeof stack);
+    if (pp)
+        log_line("Reset to %ux%u %s, from %s", pp->BackBufferWidth, pp->BackBufferHeight,
+                 pp->Windowed ? "windowed" : "full screen", stack[0] ? stack : "?");
+    HRESULT hr = CALL_ORIG(16, HRESULT (WINAPI *)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *), d, pp);
+    if (SUCCEEDED(hr))
+        log_line("Reset succeeded");
+    else
+        held_report(hr);
+    return hr;
+}
+
+static HRESULT WINAPI w_GetBackBuffer(IDirect3DDevice9 *d, UINT chain, UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface9 **out)
+{
+    HRESULT hr = CALL_ORIG(18, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface9 **), d, chain, index, type, out);
+    if (SUCCEEDED(hr) && out) held_fetched(*out, __builtin_return_address(0));
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateTexture(IDirect3DDevice9 *d, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt,
+                                      D3DPOOL pool, IDirect3DTexture9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(23, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9 **, HANDLE *),
+                           d, w, h, levels, usage, fmt, pool, out, shared);
+    if (SUCCEEDED(hr) && out && pool == D3DPOOL_DEFAULT) held_made(*out, HELD_TEXTURE, w, h, fmt, usage, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateVolumeTexture(IDirect3DDevice9 *d, UINT w, UINT h, UINT depth, UINT levels, DWORD usage,
+                                            D3DFORMAT fmt, D3DPOOL pool, IDirect3DVolumeTexture9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(24, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture9 **, HANDLE *),
+                           d, w, h, depth, levels, usage, fmt, pool, out, shared);
+    if (SUCCEEDED(hr) && out && pool == D3DPOOL_DEFAULT) held_made(*out, HELD_VOLUME, w, h, fmt, usage, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateCubeTexture(IDirect3DDevice9 *d, UINT edge, UINT levels, DWORD usage, D3DFORMAT fmt,
+                                          D3DPOOL pool, IDirect3DCubeTexture9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(25, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DCubeTexture9 **, HANDLE *),
+                           d, edge, levels, usage, fmt, pool, out, shared);
+    if (SUCCEEDED(hr) && out && pool == D3DPOOL_DEFAULT) held_made(*out, HELD_CUBE, edge, edge, fmt, usage, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateVertexBuffer(IDirect3DDevice9 *d, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
+                                           IDirect3DVertexBuffer9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(26, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, DWORD, DWORD, D3DPOOL, IDirect3DVertexBuffer9 **, HANDLE *),
+                           d, length, usage, fvf, pool, out, shared);
+    if (SUCCEEDED(hr) && out && pool == D3DPOOL_DEFAULT) held_made(*out, HELD_VB, length, 0, fvf, usage, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateIndexBuffer(IDirect3DDevice9 *d, UINT length, DWORD usage, D3DFORMAT fmt, D3DPOOL pool,
+                                          IDirect3DIndexBuffer9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(27, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DIndexBuffer9 **, HANDLE *),
+                           d, length, usage, fmt, pool, out, shared);
+    if (SUCCEEDED(hr) && out && pool == D3DPOOL_DEFAULT) held_made(*out, HELD_IB, length, 0, fmt, usage, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateRenderTarget(IDirect3DDevice9 *d, UINT w, UINT h, D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms,
+                                           DWORD quality, BOOL lockable, IDirect3DSurface9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(28, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **, HANDLE *),
+                           d, w, h, fmt, ms, quality, lockable, out, shared);
+    if (SUCCEEDED(hr) && out) held_made(*out, HELD_RT, w, h, fmt, D3DUSAGE_RENDERTARGET, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateDepthStencilSurface(IDirect3DDevice9 *d, UINT w, UINT h, D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms,
+                                                  DWORD quality, BOOL discard, IDirect3DSurface9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(29, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **, HANDLE *),
+                           d, w, h, fmt, ms, quality, discard, out, shared);
+    if (SUCCEEDED(hr) && out) held_made(*out, HELD_DS, w, h, fmt, D3DUSAGE_DEPTHSTENCIL, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_CreateOffscreenPlainSurface(IDirect3DDevice9 *d, UINT w, UINT h, D3DFORMAT fmt, D3DPOOL pool,
+                                                    IDirect3DSurface9 **out, HANDLE *shared)
+{
+    HRESULT hr = CALL_ORIG(36, HRESULT (WINAPI *)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DPOOL, IDirect3DSurface9 **, HANDLE *),
+                           d, w, h, fmt, pool, out, shared);
+    if (SUCCEEDED(hr) && out && pool == D3DPOOL_DEFAULT) held_made(*out, HELD_PLAIN, w, h, fmt, 0, FRAME());
+    return hr;
+}
+
+static HRESULT WINAPI w_GetRenderTarget(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 **out)
+{
+    HRESULT hr = CALL_ORIG(38, HRESULT (WINAPI *)(IDirect3DDevice9 *, DWORD, IDirect3DSurface9 **), d, index, out);
+    if (SUCCEEDED(hr) && out) held_fetched(*out, __builtin_return_address(0));
+    return hr;
+}
+
+static HRESULT WINAPI w_GetDepthStencilSurface(IDirect3DDevice9 *d, IDirect3DSurface9 **out)
+{
+    HRESULT hr = CALL_ORIG(40, HRESULT (WINAPI *)(IDirect3DDevice9 *, IDirect3DSurface9 **), d, out);
+    if (SUCCEEDED(hr) && out) held_fetched(*out, __builtin_return_address(0));
+    return hr;
+}
+
+static const struct { unsigned slot; void *wrapper; } dev_wraps[] = {
+    { 13, (void *)w_CreateAdditionalSwapChain }, { 16, (void *)w_Reset }, { 18, (void *)w_GetBackBuffer },
+    { 23, (void *)w_CreateTexture }, { 24, (void *)w_CreateVolumeTexture }, { 25, (void *)w_CreateCubeTexture },
+    { 26, (void *)w_CreateVertexBuffer }, { 27, (void *)w_CreateIndexBuffer }, { 28, (void *)w_CreateRenderTarget },
+    { 29, (void *)w_CreateDepthStencilSurface }, { 36, (void *)w_CreateOffscreenPlainSurface },
+    { 38, (void *)w_GetRenderTarget }, { 40, (void *)w_GetDepthStencilSurface },
+};
+
+/* Wrap DXVK's device vtable, once, as soon as DXVK is loaded: before GTA
+ * creates its device, so nothing made in D3DPOOL_DEFAULT is missed. */
+static int track_resets(void)
+{
+    if (tracking) return 1;
+    HMODULE mod = GetModuleHandleA("d3d9.dll");
+    void **vt = mod ? find_vtable(mod, "N4dxvk12D3D9DeviceExE") : NULL;
+    if (!vt) return 0;
+    if (!(held = calloc(HELD_SLOTS, sizeof *held))) return 0;
+    dxvk_module = mod;
+    DWORD old;
+    if (!VirtualProtect(vt, DEVICE_METHODS * sizeof *vt, PAGE_READWRITE, &old)) {
+        free(held);
+        held = NULL;
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof dev_wraps / sizeof *dev_wraps; i++) {
+        dev_orig[dev_wraps[i].slot] = vt[dev_wraps[i].slot];   /* before the swap: a call in flight finds it */
+        InterlockedExchange((LONG *)&vt[dev_wraps[i].slot], (LONG)(uintptr_t)dev_wraps[i].wrapper);
+    }
+    VirtualProtect(vt, DEVICE_METHODS * sizeof *vt, old, &old);
+    tracking = 1;
+    char at[160];
+    log_line("watching Reset on DXVK's device (its Reset entry was %s): a failed one lists who holds D3DPOOL_DEFAULT resources",
+             where(dev_orig[16], at, sizeof at) ? at : "?");
+    return 1;
+}
+
 /* Hook a device: every method from another thread; under DXVK, deleted
  * resources too. Exported so the test harness can hand it a device. */
 __declspec(dllexport) int d3d9watch_attach(void *device, HWND window);
 __declspec(dllexport) int d3d9watch_attach(void *device, HWND window)
 {
     if (ntables || !device) return 0;
+    track_resets();   /* normally done by the watcher thread before the device exists */
     render_tid = GetWindowThreadProcessId(window, NULL);
     if (!render_tid) render_tid = GetCurrentThreadId();
     stubs = VirtualAlloc(NULL, MAX_TABLES * MAX_METHODS * STUB_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -502,6 +961,7 @@ static DWORD WINAPI watch(void *unused)
         log_line("not gta_sa.exe 1.0 US (no push 0xC97C28 at 0x%X); not watching", GTA_CREATE_PUSH);
         return 0;
     }
+    track_resets();   /* gta_sa.exe imports d3d9.dll: DXVK is already loaded */
     for (int i = 0; i < 6000; i++) {   /* ten minutes */
         void *device = *(void *volatile *)GTA_DEVICE_SLOT;
         HWND window = *(HWND volatile *)GTA_WINDOW_SLOT;
