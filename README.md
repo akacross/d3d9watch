@@ -10,8 +10,10 @@ call from another thread races the game. Calling a method on a texture or
 buffer that has been deleted, or binding one, is just as bad. Under DXVK both
 leave damage that surfaces much later and elsewhere: the DXVK allocator's free
 list off by one, `d3d9.dll+0x1A63E9`, three times on 2026-10-11 and 10-12
-(see the moonloader workspace's crash notes). The dump shows the aftermath,
-never the culprit; this plugin is there for the next time.
+(the analysis is in
+[samp-openmp-linux](https://github.com/akacross/samp-openmp-linux/blob/main/docs/DXVK-CRASH.md)).
+The dump shows the aftermath, never the culprit; this plugin is there for the
+next time.
 
 ## What it reports
 
@@ -80,3 +82,7 @@ checks 16 things:
   caught;
 - the same through the base-class vtable a destructor leaves: caught;
 - a live texture: not reported.
+
+## License
+
+MIT.
